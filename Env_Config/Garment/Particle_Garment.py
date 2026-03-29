@@ -160,9 +160,6 @@ class Particle_Garment:
         self.particle_system_api=PhysxSchema.PhysxParticleAPI.Apply(self.particle_system.prim)
         return self.particle_system_api.GetParticleGroupAttr().Get()
     
-    def get_vertices_positions(self):
-        return self.garment_mesh._get_points_pose()
-    
     def apply_visual_material(self,material_path:str):
         self.visual_material_path=find_unique_string_name(self.garment_prim_path+"/visual_material",is_unique_fn=lambda x: not is_prim_path_valid(x))
         add_reference_to_stage(usd_path=material_path,prim_path=self.visual_material_path)
@@ -184,7 +181,16 @@ class Particle_Garment:
                 prim_path=prim.GetPath(), material_path=self.material_prim_path)
         
     def get_vertice_positions(self):
-        return self.garment_mesh._get_points_pose()
+        pos_world, ori_world = self.garment_mesh.get_world_pose()
+        scale_world = self.garment_mesh.get_world_scale()
+        mesh_points = self.garment_mesh._get_points_pose() # If backend device is torch, add '.detach().cpu().numpy()'
+        transformed_mesh_points = self.transform_points(
+            mesh_points,
+            pos_world,     # If backend device is torch, add '.detach().cpu().numpy()'
+            ori_world,     # If backend device is torch, add '.detach().cpu().numpy()'
+            scale_world,   # If backend device is torch, add '.detach().cpu().numpy()'
+        )
+        return transformed_mesh_points
     
     def set_pose(self, pos, ori):
         if ori is not None:
@@ -199,3 +205,83 @@ class Particle_Garment:
 
     def set_mass(self,mass=0.02):
         physicsUtils.add_mass(self.world.stage, self.garment_mesh_prim_path, mass)
+
+    def transform_points(self, points, pos, ori, scale):
+        """
+        Transform local points to world space using position, orientation, and scale.
+
+        Args:
+            points: (N, 3) array of local points
+            pos: (3,) position vector
+            ori: (4,) quaternion orientation
+            scale: Scale factor (numpy array)
+
+        Returns:
+            (N, 3) array of transformed points in world space
+        """
+        ori_matrix = self.quat_to_rot_matrix(ori)  # Expects numpy array, returns numpy array
+        scaled_points = (
+            points * scale
+        )  # element-wise multiplication if scale is numpy array
+        transformed_points = scaled_points @ ori_matrix.T + pos
+        return transformed_points
+
+    def quat_to_rot_matrix(quat: torch.Tensor) -> torch.Tensor:
+        """
+        Convert input quaternion to rotation matrix.
+    
+        Args:
+            quat (torch.Tensor): (..., 4) with (w, x, y, z)
+    
+        Returns:
+            torch.Tensor: (..., 3, 3)
+        """
+    
+        if not isinstance(quat, torch.Tensor):
+            quat = torch.tensor(quat, dtype=torch.float32)
+        q = quat.clone()
+        nq = torch.sum(q * q, dim=-1)
+        small = nq < 1e-10
+        scale = torch.sqrt(2.0 / torch.clamp(nq, min=1e-10))
+        q = q * scale.unsqueeze(-1)
+    
+        # Outer product: (..., 4, 4)
+        q_outer = q.unsqueeze(-1) @ q.unsqueeze(-2)  # (..., 4, 4)
+    
+        R = torch.stack(
+            [
+                torch.stack(
+                    [
+                        1.0 - q_outer[..., 2, 2] - q_outer[..., 3, 3],
+                        q_outer[..., 1, 2] - q_outer[..., 3, 0],
+                        q_outer[..., 1, 3] + q_outer[..., 2, 0],
+                    ],
+                    dim=-1,
+                ),
+                torch.stack(
+                    [
+                        q_outer[..., 1, 2] + q_outer[..., 3, 0],
+                        1.0 - q_outer[..., 1, 1] - q_outer[..., 3, 3],
+                        q_outer[..., 2, 3] - q_outer[..., 1, 0],
+                    ],
+                    dim=-1,
+                ),
+                torch.stack(
+                    [
+                        q_outer[..., 1, 3] - q_outer[..., 2, 0],
+                        q_outer[..., 2, 3] + q_outer[..., 1, 0],
+                        1.0 - q_outer[..., 1, 1] - q_outer[..., 2, 2],
+                    ],
+                    dim=-1,
+                ),
+            ],
+            dim=-2,
+        )
+    
+        # Handle near-zero norm case
+        R = torch.where(
+            small.unsqueeze(-1).unsqueeze(-1),
+            torch.eye(3, dtype=q.dtype, device=q.device),
+            R,
+        )
+        return R
